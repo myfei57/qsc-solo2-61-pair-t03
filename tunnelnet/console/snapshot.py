@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tunnelnet.alarms import board_report
 from tunnelnet.ns import control_chain
 from tunnelnet.store import store_state
 
@@ -30,4 +31,5 @@ def collect(rt: "Runtime") -> dict[str, object]:
         "cables": rt.cables.summary().as_dict(),
         "suppression": {"zones": rt.suppression.distinct_zones()},
         "audit": rt.audit.state().as_dict(),
+        "alarms": board_report(rt.alarms).as_dict(),
     }

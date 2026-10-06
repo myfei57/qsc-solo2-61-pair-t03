@@ -39,6 +39,16 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     rt.drain.start_drain(cabin_id)
     rt.drain.record_cycle(cabin_id, at)
 
+    # Keep the disposition board current on every cycle: raised upstream
+    # alarms merge here, due suspends pop and overdue alarms escalate.  The
+    # probe label "t" is not a real timestamp, so only run the tick when the
+    # cycle supplied a canonical stamp.
+    board_due = {"resumed": [], "escalated": []}
+    try:
+        board_due = rt.alarms.run_due(at) if at else {"resumed": [], "escalated": []}
+    except ValueError:
+        pass
+
     record_event(rt, "cycle", cabin_id)
     line = control_chain()
 
@@ -53,6 +63,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "usage": usage,
             "drain_runs": rt.drain.run_count(),
             "audit_count": rt.audit.count(),
+            "alarm_board": board_due,
             "last_stage": Stage.AUDIT.value if line.contains(Stage.AUDIT) else "",
         }
     )

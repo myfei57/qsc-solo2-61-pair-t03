@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tunnelnet.access import AccessService
+from tunnelnet.alarms import AlarmBoard, AlarmRepository, LEVEL_NAMES, Roster, Shift
 from tunnelnet.audit import AuditRegistry, MarkSet
 from tunnelnet.cabin import PartitionTable, PowerBook, Registry as CabinRegistry, SuppressionLog
 from tunnelnet.cable import CableRegistry, MovingAverage
@@ -17,6 +18,15 @@ from tunnelnet.vent import VentService
 
 DEFAULT_ZONES = ("zone-1", "zone-2", "zone-3")
 DEFAULT_THRESHOLD = 75.0
+
+#: One always-on watch covering the whole escalation ladder, used until a
+#: real roster is loaded.  Alarms must never be raised without an assignee.
+DEFAULT_WATCH = Shift(
+    id="watch-default",
+    starts_at="2000-01-01T00:00:00Z",
+    ends_at="2099-01-01T00:00:00Z",
+    members={1: "operator", 2: "shift-lead", 3: "duty-manager", 4: "director"},
+)
 
 
 class Runtime:
@@ -41,3 +51,27 @@ class Runtime:
         self.power_book = PowerBook()
         self.quota = QuotaService(self.cabins, self.power_book)
         self.audit = AuditRegistry()
+        self.roster = Roster(default=DEFAULT_WATCH)
+        self.alarm_repository = AlarmRepository(store)
+        self.alarms = AlarmBoard(self.roster, repository=self.alarm_repository)
+        self._load_persisted_shifts()
+
+    def _load_persisted_shifts(self) -> None:
+        """Restore scheduled watches so handover rules survive a restart."""
+
+        name_to_level = {name: level for level, name in LEVEL_NAMES.items()}
+        for row in self.alarm_repository.load_shifts():
+            members = {
+                name_to_level[name]: str(person)
+                for name, person in row.get("members", {}).items()
+                if name in name_to_level
+            }
+            self.roster.put(
+                Shift(
+                    id=str(row.get("id", "")),
+                    starts_at=str(row.get("starts_at", "")),
+                    ends_at=str(row.get("ends_at", "")),
+                    members=members,
+                    domains=tuple(str(item) for item in row.get("domains", [])),
+                )
+            )

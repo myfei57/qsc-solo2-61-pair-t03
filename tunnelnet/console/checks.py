@@ -77,4 +77,17 @@ def run_checks(rt: "Runtime") -> list[dict[str, str]]:
     )
 
     checks.append({"name": "audit", "status": "ok", "detail": f"records={rt.audit.count()}"})
+
+    board_counts = rt.alarms.counts()
+    open_alarms = board_counts["open"]
+    checks.append(
+        {
+            "name": "alarms",
+            "status": "warn" if open_alarms else "ok",
+            "detail": (
+                f"open={open_alarms} pending={board_counts['pending']} "
+                f"processing={board_counts['processing']} suspended={board_counts['suspended']}"
+            ),
+        }
+    )
     return checks

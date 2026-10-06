@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tunnelnet.alarms import feeder
+from tunnelnet.alarms import SOURCE_CABLE, SOURCE_ENV, SOURCE_FIRE
+from tunnelnet.alarms import board_report as alarm_board_report
+from tunnelnet.alarms import source_status
+from tunnelnet.alarms.clock import parse as parse_board_stamp
+from tunnelnet.alarms.clock import utc_now as utc_now_stamp
 from tunnelnet.audit import between, events, filter_records, last, most_recent
 from tunnelnet.cabin import Cabin, status_summary
 from tunnelnet.cable import danger_count, healthy_count, load_factor
@@ -30,6 +36,16 @@ from .version import version_payload
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .server import Server
+
+
+def _is_board_stamp(value: str) -> bool:
+    """Whether ``value`` parses as the board's canonical UTC stamp."""
+
+    try:
+        parse_board_stamp(value)
+    except ValueError:
+        return False
+    return True
 
 
 def health(server: "Server", request: Request) -> Response:
@@ -262,6 +278,11 @@ def env_overview(server: "Server", request: Request) -> Response:
             "alarms": [alarm.as_dict() for alarm in env.alarms()],
             "sensor_1_cabin": env.route_alarm("sensor-1"),
             "threshold": env.threshold(),
+            "disposition": source_status(server.runtime.alarms, SOURCE_ENV).as_dict(),
+            "dispositions": [
+                alarm.as_dict()
+                for alarm in server.runtime.alarms.list(source=SOURCE_ENV, include_closed=False)
+            ],
         }
     )
 
@@ -305,10 +326,20 @@ def env_filter(server: "Server", request: Request) -> Response:
 
 
 def env_sample(server: "Server", request: Request) -> Response:
-    alarmed = server.runtime.env.sample(
-        request.str_field("sensor_id"), request.float_field("value"), request.str_field("at")
-    )
-    return json_response({"alarmed": alarmed})
+    sensor_id = request.str_field("sensor_id")
+    value = request.float_field("value")
+    at = request.str_field("at")
+    alarmed = server.runtime.env.sample(sensor_id, value, at)
+    disposition = None
+    if alarmed:
+        # Merge into the shared board; repeated hot samples stay one alarm.
+        # The board needs a real wall-clock stamp even when the caller used
+        # a free-form probe label like "t".
+        stamp = at if _is_board_stamp(at) else utc_now_stamp()
+        disposition = feeder.raise_environment(
+            server.runtime.alarms, sensor_id, value, stamp
+        ).as_dict()
+    return json_response({"alarmed": alarmed, "disposition": disposition})
 
 
 def env_partition(server: "Server", request: Request) -> Response:
@@ -467,7 +498,13 @@ def fire_alarms(server: "Server", request: Request) -> Response:
 
 
 def fire_report(server: "Server", request: Request) -> Response:
-    return json_response(server.runtime.fire.report().as_dict())
+    payload = server.runtime.fire.report().as_dict()
+    payload["disposition"] = source_status(server.runtime.alarms, SOURCE_FIRE).as_dict()
+    payload["dispositions"] = [
+        alarm.as_dict()
+        for alarm in server.runtime.alarms.list(source=SOURCE_FIRE, include_closed=False)
+    ]
+    return json_response(payload)
 
 
 def fire_detector_add(server: "Server", request: Request) -> Response:
@@ -484,14 +521,16 @@ def fire_detect(server: "Server", request: Request) -> Response:
         raise RequestError(404, f"detector {detector_id} not found")
     fire.detect(detector_id)
     record_event(server.runtime, "fire_detect", detector_id)
-    return json_response({"detector": detector_id, "zone": zone})
+    disposition = feeder.raise_fire(server.runtime.alarms, zone, utc_now_stamp()).as_dict()
+    return json_response({"detector": detector_id, "zone": zone, "disposition": disposition})
 
 
 def fire_smoke(server: "Server", request: Request) -> Response:
     zone = request.str_field("zone")
     server.runtime.fire.handle_smoke(zone)
     record_event(server.runtime, "fire_smoke", zone)
-    return json_response({"ok": True, "zone": zone})
+    disposition = feeder.raise_fire(server.runtime.alarms, zone, utc_now_stamp()).as_dict()
+    return json_response({"ok": True, "zone": zone, "disposition": disposition})
 
 
 def fire_zone(server: "Server", request: Request) -> Response:
@@ -583,25 +622,46 @@ def cable_health(server: "Server", request: Request) -> Response:
             "danger": danger_count(cables, 75.0),
             "healthy": healthy_count(cables, 75.0),
             "load_factor": load_factor(cables),
+            "disposition": source_status(server.runtime.alarms, SOURCE_CABLE).as_dict(),
+            "dispositions": [
+                alarm.as_dict()
+                for alarm in server.runtime.alarms.list(source=SOURCE_CABLE, include_closed=False)
+            ],
         }
     )
+
+
+def _cable_overtemp_alarm(rt, cable_id: str, temp: float, state) -> dict[str, object] | None:
+    """Raise a board alarm when a cable enters or stays in the over band."""
+
+    if state is None or state.status != "over":
+        return None
+    return feeder.raise_cable(rt.alarms, cable_id, temp, utc_now_stamp()).as_dict()
 
 
 def cable_temp(server: "Server", request: Request) -> Response:
     cables = server.runtime.cables
     cable_id = request.str_field("cable_id")
-    if not cables.set_temp(cable_id, request.float_field("temp")):
+    temp = request.float_field("temp")
+    if not cables.set_temp(cable_id, temp):
         raise RequestError(404, "cable not found")
     state = cables.get(cable_id)
-    return json_response({} if state is None else state.as_dict())
+    if state is None:
+        return json_response({})
+    disposition = _cable_overtemp_alarm(server.runtime, cable_id, temp, state)
+    payload = state.as_dict()
+    payload["disposition"] = disposition
+    return json_response(payload)
 
 
 def cable_sample(server: "Server", request: Request) -> Response:
     cables = server.runtime.cables
     cable_id = request.str_field("cable_id")
-    if not cables.sample(cable_id, request.float_field("value")):
+    value = request.float_field("value")
+    if not cables.sample(cable_id, value):
         raise RequestError(404, "cable not found")
-    return json_response({"history": cables.history(cable_id)})
+    disposition = _cable_overtemp_alarm(server.runtime, cable_id, value, cables.get(cable_id))
+    return json_response({"history": cables.history(cable_id), "disposition": disposition})
 
 
 def quota_report(server: "Server", request: Request) -> Response:
@@ -690,7 +750,17 @@ def audit_query(server: "Server", request: Request) -> Response:
 
 def audit_summary(server: "Server", request: Request) -> Response:
     registry = server.runtime.audit
-    return json_response({"summary": registry.summary(), "by_event": registry.count_by_event()})
+    # The audit page reads disposition from the same board as every source
+    # page; it never keeps a private copy of alarm state.
+    dispositions = alarm_board_report(server.runtime.alarms).as_dict()
+    return json_response(
+        {
+            "summary": registry.summary(),
+            "by_event": registry.count_by_event(),
+            "alarm_dispositions": dispositions["counts"],
+            "alarm_history_intact": all(server.runtime.alarms.verify_all().values()),
+        }
+    )
 
 
 def audit_marks(server: "Server", request: Request) -> Response:
@@ -774,3 +844,31 @@ def export_telemetry(server: "Server", request: Request) -> Response:
 def export_store(server: "Server", request: Request) -> Response:
     columns, rows = store_csv_export(server.runtime.store)
     return csv_response(to_csv(columns, rows))
+
+
+# ---------------------------------------------------------------------------
+# Alarm disposition board.  Implemented in a dedicated module; aliased here
+# because the route table binds every handler by attribute on this module.
+from . import alarm_handlers as _alarm_handlers  # noqa: E402
+
+alarms_board = _alarm_handlers.alarms_board_report
+roster_shifts = _alarm_handlers.roster_shifts
+roster_shift_put = _alarm_handlers.roster_shift_put
+roster_active = _alarm_handlers.roster_active
+alarms_by_source = _alarm_handlers.alarms_by_source
+alarms_outbox = _alarm_handlers.alarms_outbox
+alarms_flush = _alarm_handlers.alarms_flush
+alarms_tick = _alarm_handlers.alarms_tick
+alarm_handover = _alarm_handlers.alarm_handover
+alarms_list = _alarm_handlers.alarms_list
+alarm_raise = _alarm_handlers.alarm_raise
+alarm_detail = _alarm_handlers.alarm_detail
+alarm_history = _alarm_handlers.alarm_history
+alarm_history_export = _alarm_handlers.alarm_history_csv
+alarm_verify = _alarm_handlers.alarm_verify
+alarm_acknowledge = _alarm_handlers.alarm_acknowledge
+alarm_suspend = _alarm_handlers.alarm_suspend
+alarm_resume = _alarm_handlers.alarm_resume
+alarm_close = _alarm_handlers.alarm_close
+alarm_escalate = _alarm_handlers.alarm_escalate
+alarm_reassign = _alarm_handlers.alarm_reassign

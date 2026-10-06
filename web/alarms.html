@@ -1,35 +1,137 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Alarms</title>
+<title>告警处置</title>
 <style>
 body { font-family: system-ui, sans-serif; margin: 2rem; color: #1b1f24; }
 nav a { margin-right: 1rem; color: #0b5fff; text-decoration: none; }
-ul { line-height: 1.7; }
+table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+th, td { border: 1px solid #d0d7de; padding: 0.4rem 0.75rem; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; }
+.state-pending { color: #b45309; font-weight: 600; }
+.state-processing { color: #1d4ed8; font-weight: 600; }
+.state-suspended { color: #7c3aed; font-weight: 600; }
+.state-closed { color: #15803d; }
+.badge { display: inline-block; padding: 0 .4rem; border-radius: 1rem; background: #eef2f7; font-size: .8rem; }
+#history { white-space: pre-wrap; background: #f6f8fa; padding: .75rem; border-radius: .4rem; max-height: 20rem; overflow: auto; }
+.controls button { margin-right: .35rem; }
+small { color: #57606a; }
 </style>
 </head>
 <body>
 <nav><a href="/cabins">Cabins</a><a href="/env">Environment</a><a href="/patrols">Patrols</a><a href="/alarms">Alarms</a></nav>
-<h1>Alarms</h1>
+<h1>告警处置闭环</h1>
 <p id="summary"></p>
-<h2>Fire linkage</h2>
-<ul id="fire"></ul>
-<h2>Environment</h2>
-<ul id="env"></ul>
+<p>
+  <label>来源 <select id="source-filter">
+    <option value="">全部</option>
+    <option value="environment">环境超温</option>
+    <option value="fire">消防烟感</option>
+    <option value="cable">电缆过温</option>
+  </select></label>
+  <label><input type="checkbox" id="closed-filter"> 包含已关闭</label>
+  <button id="refresh">刷新</button>
+  <button id="tick">执行定时巡检（挂起到期 / 超时升级）</button>
+</p>
+<table>
+<thead><tr>
+  <th>告警</th><th>来源</th><th>状态</th><th>升级级别</th><th>责任人</th>
+  <th>重复次数</th><th>挂起到期</th><th>处置</th>
+</tr></thead>
+<tbody id="rows"></tbody>
+</table>
+
+<h2>处置历史（不可改写，哈希链校验）</h2>
+<p id="verify"></p>
+<div id="history"><small>选择一条告警查看其处置链。</small></div>
+
 <script>
-async function load() {
-  const fire = await (await fetch("/api/fire/report")).json();
-  document.getElementById("summary").textContent =
-    `Detectors ${fire.detector_count}, zones ${fire.zone_count}, alarms ${fire.alarm_count}`;
-  document.getElementById("fire").innerHTML =
-    fire.alarms.map((key) => `<li>${key}</li>`).join("");
-  const environment = await (await fetch("/api/env")).json();
-  document.getElementById("env").innerHTML =
-    environment.alarms.map((alarm) => `<li>${alarm.sensor_id}: ${alarm.value}</li>`).join("");
+const SOURCE_NAME = {environment: "环境超温", fire: "消防烟感", cable: "电缆过温"};
+const LEVEL_NAME = {1: "值班员", 2: "班组长", 3: "值班经理", 4: "值班总监"};
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  return response.json();
 }
-load();
+function post(path, payload) {
+  return api(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+}
+
+async function loadBoard() {
+  const source = document.getElementById("source-filter").value;
+  const includeClosed = document.getElementById("closed-filter").checked ? "1" : "0";
+  const query = new URLSearchParams({closed: includeClosed});
+  if (source) query.set("source", source);
+  const data = await api(`/api/alarms?${query}`);
+  const report = await api("/api/alarms/board");
+  const c = report.counts;
+  document.getElementById("summary").innerHTML =
+    `待确认 <b>${c.pending}</b> · 处理中 <b>${c.processing}</b> · 挂起 <b>${c.suspended}</b> · ` +
+    `已关闭 <b>${c.closed}</b> · 打开共 <b>${c.open}</b> · 待发通知 <b>${report.notifications_pending}</b>`;
+
+  document.getElementById("rows").innerHTML = data.items.map((alarm) => `
+    <tr>
+      <td><a href="#" data-id="${alarm.id}" class="open-history">${alarm.id}</a><br><small>${alarm.subject}</small></td>
+      <td>${SOURCE_NAME[alarm.source] || alarm.source}</td>
+      <td class="state-${alarm.state}">${alarm.state}</td>
+      <td><span class="badge">${LEVEL_NAME[alarm.level] || alarm.level}</span></td>
+      <td>${alarm.assignee || "—"}</td>
+      <td>${alarm.occurrence_count}</td>
+      <td>${alarm.suspend_until || "—"}</td>
+      <td class="controls">
+        ${alarm.state === "pending" ? `<button data-action="acknowledge" data-id="${alarm.id}">确认</button>` : ""}
+        ${alarm.state === "processing" ? `<button data-action="suspend" data-id="${alarm.id}">挂起</button>` : ""}
+        ${alarm.state === "suspended" ? `<button data-action="resume" data-id="${alarm.id}">恢复</button>` : ""}
+        ${alarm.state !== "closed" ? `<button data-action="escalate" data-id="${alarm.id}">升级</button>` : ""}
+        ${alarm.state !== "closed" ? `<button data-action="close" data-id="${alarm.id}">关闭</button>` : ""}
+      </td>
+    </tr>`).join("");
+}
+
+async function showHistory(alarmId) {
+  const detail = await api(`/api/alarms/detail?id=${encodeURIComponent(alarmId)}`);
+  document.getElementById("verify").textContent =
+    `历史链完整性：${detail.history_intact ? "✔ 校验通过" : "✘ 已被破坏"}`;
+  document.getElementById("history").textContent = detail.history.map((event) =>
+    `#${event.seq} ${event.at} ${event.kind}${event.actor ? "  by " + event.actor : ""}\n` +
+    `   ${JSON.stringify(event.detail)}\n   chain=${event.chain.slice(0, 16)}…`
+  ).join("\n");
+}
+
+document.addEventListener("click", async (event) => {
+  const historyLink = event.target.closest(".open-history");
+  if (historyLink) {
+    event.preventDefault();
+    await showHistory(historyLink.dataset.id);
+    return;
+  }
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const {id, action} = button.dataset;
+  const payload = {id, actor: "operator"};
+  if (action === "suspend") {
+    const minutes = prompt("挂起多少分钟后自动重新弹出？", "30");
+    if (minutes === null) return;
+    payload.seconds = Number(minutes) * 60;
+    payload.reason = "operator suspend";
+  }
+  if (action === "close") payload.reason = "resolved";
+  const result = await post(`/api/alarms/${action}`, payload);
+  if (result.error) alert(result.error);
+  await loadBoard();
+});
+
+document.getElementById("refresh").addEventListener("click", loadBoard);
+document.getElementById("source-filter").addEventListener("change", loadBoard);
+document.getElementById("closed-filter").addEventListener("change", loadBoard);
+document.getElementById("tick").addEventListener("click", async () => {
+  const result = await post("/api/alarms/tick", {});
+  alert(`重新弹出：${result.resumed.length} 条；升级：${result.escalated.length} 条`);
+  await loadBoard();
+});
+loadBoard();
 </script>
 </body>
 </html>
