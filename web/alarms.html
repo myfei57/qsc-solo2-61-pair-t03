@@ -8,26 +8,40 @@
 body { font-family: system-ui, sans-serif; margin: 2rem; color: #1b1f24; }
 nav a { margin-right: 1rem; color: #0b5fff; text-decoration: none; }
 ul { line-height: 1.7; }
+table { border-collapse: collapse; margin-top: 1rem; }
+th, td { border: 1px solid #d0d7de; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
+th { background: #f6f8fa; }
+.state-open { background: #ffebe9; }
+.state-active { background: #fff8c5; }
+.state-suspended { background: #ddf4ff; }
+.state-closed { background: #dafbe1; }
 </style>
 </head>
 <body>
-<nav><a href="/cabins">Cabins</a><a href="/env">Environment</a><a href="/patrols">Patrols</a><a href="/alarms">Alarms</a></nav>
+<nav><a href="/cabins">Cabins</a><a href="/env">Environment</a><a href="/patrols">Patrols</a><a href="/alarms">Alarms</a><a href="/incidents">Incidents</a></nav>
 <h1>Alarms</h1>
 <p id="summary"></p>
-<h2>Fire linkage</h2>
-<ul id="fire"></ul>
-<h2>Environment</h2>
-<ul id="env"></ul>
+<h2>Disposition (one shared state for env, fire and cable)</h2>
+<table>
+<thead><tr><th>ID</th><th>Source</th><th>Severity</th><th>State</th><th>Level</th><th>Owner</th><th>Reports</th><th>Due</th></tr></thead>
+<tbody id="incidents"></tbody>
+</table>
+<p><a href="/incidents">Open the disposition console &rarr;</a></p>
 <script>
 async function load() {
   const fire = await (await fetch("/api/fire/report")).json();
+  const incidents = await (await fetch("/api/incidents")).json();
+  const c = incidents.counts;
   document.getElementById("summary").textContent =
-    `Detectors ${fire.detector_count}, zones ${fire.zone_count}, alarms ${fire.alarm_count}`;
-  document.getElementById("fire").innerHTML =
-    fire.alarms.map((key) => `<li>${key}</li>`).join("");
-  const environment = await (await fetch("/api/env")).json();
-  document.getElementById("env").innerHTML =
-    environment.alarms.map((alarm) => `<li>${alarm.sensor_id}: ${alarm.value}</li>`).join("");
+    `Fire detectors ${fire.detector_count}, zones ${fire.zone_count}, raw fire keys ${fire.alarm_count}; ` +
+    `disposition tickets: open ${c.open}, active ${c.active}, suspended ${c.suspended}, closed ${c.closed}`;
+  const due = (t) => t.state === "closed" ? t.closed_at
+    : t.state === "suspended" ? "suspend " + t.suspend_due
+    : (t.state === "open" ? "ack " + t.ack_due : "resolve " + t.resolve_due);
+  document.getElementById("incidents").innerHTML = incidents.tickets.map((t) =>
+    `<tr class="state-${t.state}"><td>${t.id}</td><td>${t.source}</td><td>${t.severity}</td>
+     <td>${t.state}</td><td>L${t.level}</td><td>${t.owner || "(unassigned)"}</td>
+     <td>${t.occurrence}</td><td><small>${due(t)}</small></td></tr>`).join("");
 }
 load();
 </script>

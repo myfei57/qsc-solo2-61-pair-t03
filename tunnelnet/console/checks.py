@@ -77,4 +77,23 @@ def run_checks(rt: "Runtime") -> list[dict[str, str]]:
     )
 
     checks.append({"name": "audit", "status": "ok", "detail": f"records={rt.audit.count()}"})
+
+    try:
+        rt.incidents.verify_history()
+        history_ok = True
+    except Exception:
+        history_ok = False
+    counts = rt.incidents.counts()
+    pending_notifications = len(rt.incidents.outbox())
+    checks.append(
+        {
+            "name": "incidents",
+            "status": "error" if not history_ok else "warn" if pending_notifications else "ok",
+            "detail": (
+                f"open={counts['open']} active={counts['active']} "
+                f"suspended={counts['suspended']} pending_notify={pending_notifications} "
+                f"history={'verified' if history_ok else 'TAMPERED'}"
+            ),
+        }
+    )
     return checks

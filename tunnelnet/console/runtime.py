@@ -9,6 +9,7 @@ from tunnelnet.cable import CableRegistry, MovingAverage
 from tunnelnet.drain import DrainService, PumpUnit
 from tunnelnet.env import Environment
 from tunnelnet.fire import FireService
+from tunnelnet.incident import EscalationPolicy, EventLog, IncidentCenter, Roster
 from tunnelnet.ns import Registry as NamespaceRegistry
 from tunnelnet.patrol import PatrolService
 from tunnelnet.quota import QuotaService
@@ -41,3 +42,10 @@ class Runtime:
         self.power_book = PowerBook()
         self.quota = QuotaService(self.cabins, self.power_book)
         self.audit = AuditRegistry()
+        # One disposition state machine for every alarm source; all pages read
+        # these projections and nothing else for disposition status.
+        self.incident_log = EventLog()
+        self.roster = Roster()
+        self.incidents = IncidentCenter(
+            self.roster, EscalationPolicy(), self.incident_log
+        )

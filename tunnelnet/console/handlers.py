@@ -17,8 +17,10 @@ from tunnelnet.store import export_all, export_kind, list_approvals, revoke_appr
 
 from . import checks, ops
 from . import describe as describe_module
+from . import incident_handlers
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
+from . import alarm_bridge
 from .audit_log import record_event
 from .cycle import run_cycle
 from .http import Request, RequestError, Response, csv_response, json_response, text_response
@@ -30,6 +32,30 @@ from .version import version_payload
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .server import Server
+
+
+# Disposition handlers live in their own module but must be addressable by the
+# single route table; expose them at module level so register_routes finds them.
+incidents_list = incident_handlers.incidents_list
+incidents_queue = incident_handlers.incidents_queue
+incidents_overdue = incident_handlers.incidents_overdue
+incidents_counts = incident_handlers.incidents_counts
+incidents_history = incident_handlers.incidents_history
+incidents_report = incident_handlers.incidents_report
+incidents_ack = incident_handlers.incidents_ack
+incidents_suspend = incident_handlers.incidents_suspend
+incidents_resume = incident_handlers.incidents_resume
+incidents_close = incident_handlers.incidents_close
+incidents_reassign = incident_handlers.incidents_reassign
+incidents_handover = incident_handlers.incidents_handover
+incidents_run_due = incident_handlers.incidents_run_due
+incidents_flush = incident_handlers.incidents_flush
+incidents_outbox = incident_handlers.incidents_outbox
+incidents_roster_list = incident_handlers.incidents_roster_list
+incidents_roster_add = incident_handlers.incidents_roster_add
+incidents_policy = incident_handlers.incidents_policy
+incidents_policy_set = incident_handlers.incidents_policy_set
+incidents_verify = incident_handlers.incidents_verify
 
 
 def health(server: "Server", request: Request) -> Response:
@@ -305,10 +331,20 @@ def env_filter(server: "Server", request: Request) -> Response:
 
 
 def env_sample(server: "Server", request: Request) -> Response:
-    alarmed = server.runtime.env.sample(
+    rt = server.runtime
+    alarmed = rt.env.sample(
         request.str_field("sensor_id"), request.float_field("value"), request.str_field("at")
     )
-    return json_response({"alarmed": alarmed})
+    disposition: dict[str, object] = {}
+    if alarmed:
+        disposition = alarm_bridge.report_env(
+            rt,
+            request.str_field("sensor_id"),
+            request.float_field("value"),
+            request.str_field("at"),
+            request.str_field("report_id"),
+        )
+    return json_response({"alarmed": alarmed, "ticket": disposition})
 
 
 def env_partition(server: "Server", request: Request) -> Response:
@@ -484,7 +520,10 @@ def fire_detect(server: "Server", request: Request) -> Response:
         raise RequestError(404, f"detector {detector_id} not found")
     fire.detect(detector_id)
     record_event(server.runtime, "fire_detect", detector_id)
-    return json_response({"detector": detector_id, "zone": zone})
+    disposition = alarm_bridge.report_fire(
+        server.runtime, zone, request.str_field("at"), request.str_field("report_id")
+    )
+    return json_response({"detector": detector_id, "zone": zone, "ticket": disposition})
 
 
 def fire_smoke(server: "Server", request: Request) -> Response:
@@ -590,10 +629,18 @@ def cable_health(server: "Server", request: Request) -> Response:
 def cable_temp(server: "Server", request: Request) -> Response:
     cables = server.runtime.cables
     cable_id = request.str_field("cable_id")
-    if not cables.set_temp(cable_id, request.float_field("temp")):
+    temp = request.float_field("temp")
+    if not cables.set_temp(cable_id, temp):
         raise RequestError(404, "cable not found")
     state = cables.get(cable_id)
-    return json_response({} if state is None else state.as_dict())
+    disposition: dict[str, object] = {}
+    if state is not None and state.status == "over":
+        disposition = alarm_bridge.report_cable(
+            server.runtime, cable_id, temp, request.str_field("at"), request.str_field("report_id")
+        )
+    payload = {} if state is None else state.as_dict()
+    payload["ticket"] = disposition
+    return json_response(payload)
 
 
 def cable_sample(server: "Server", request: Request) -> Response:

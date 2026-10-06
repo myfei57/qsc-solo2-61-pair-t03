@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Incident disposition</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1b1f24; }
+nav a { margin-right: 1rem; color: #0b5fff; text-decoration: none; }
+table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+th, td { border: 1px solid #d0d7de; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
+th { background: #f6f8fa; }
+.state-open { background: #ffebe9; }
+.state-active { background: #fff8c5; }
+.state-suspended { background: #ddf4ff; }
+.state-closed { background: #dafbe1; }
+.badge { padding: 0.1rem 0.5rem; border-radius: 1rem; font-size: 0.8rem; }
+.controls button { margin-right: 0.3rem; }
+dialog { width: 70%; max-width: 720px; }
+pre { background: #f6f8fa; padding: 0.75rem; overflow-x: auto; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<nav><a href="/cabins">Cabins</a><a href="/env">Environment</a><a href="/patrols">Patrols</a><a href="/alarms">Alarms</a><a href="/incidents">Incidents</a></nav>
+<h1>Alarm disposition</h1>
+<p id="summary"></p>
+<div class="controls">
+  <label>State
+    <select id="state-filter">
+      <option value="">all</option>
+      <option value="open">open</option>
+      <option value="active">active</option>
+      <option value="suspended">suspended</option>
+      <option value="closed">closed</option>
+    </select>
+  </label>
+  <label>Source
+    <select id="source-filter">
+      <option value="">all</option>
+      <option value="env">env</option>
+      <option value="fire">fire</option>
+      <option value="cable">cable</option>
+    </select>
+  </label>
+  <button onclick="load()">Refresh</button>
+  <button onclick="runDue()">Run due (expire / escalate)</button>
+</div>
+<table>
+<thead><tr>
+  <th>ID</th><th>Source</th><th>Severity</th><th>State</th><th>Level</th>
+  <th>Owner / shift</th><th>Reports</th><th>Opened</th><th>Due</th><th>Actions</th>
+</tr></thead>
+<tbody id="rows"></tbody>
+</table>
+
+<dialog id="history-dialog">
+  <h3>Disposition history</h3>
+  <pre id="history-body"></pre>
+  <button onclick="document.getElementById('history-dialog').close()">Close</button>
+</dialog>
+
+<script>
+async function api(path, body) {
+  const options = body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {};
+  const res = await fetch(path, options);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({error: res.statusText}));
+    alert(err.error || ("HTTP " + res.status));
+    return null;
+  }
+  return res.json();
+}
+
+function dueText(t) {
+  if (t.state === "closed") return t.closed_at;
+  if (t.state === "suspended") return "suspend " + t.suspend_due;
+  return (t.state === "open" ? "ack " : "resolve ") + (t.state === "open" ? t.ack_due : t.resolve_due);
+}
+
+async function load() {
+  const state = document.getElementById("state-filter").value;
+  const source = document.getElementById("source-filter").value;
+  const params = new URLSearchParams();
+  if (state) params.set("state", state);
+  if (source) params.set("source", source);
+  const data = await api("/api/incidents?" + params.toString());
+  if (!data) return;
+  const c = data.counts;
+  document.getElementById("summary").textContent =
+    `Total ${c.total}: open ${c.open}, active ${c.active}, suspended ${c.suspended}, closed ${c.closed}`;
+  document.getElementById("rows").innerHTML = data.tickets.map((t) => {
+    const buttons = [];
+    if (t.state === "open") buttons.push(`<button onclick="act('ack','${t.id}')">Ack</button>`);
+    if (t.state === "open" || t.state === "active") buttons.push(`<button onclick="suspend('${t.id}')">Suspend</button>`);
+    if (t.state === "suspended") buttons.push(`<button onclick="act('resume','${t.id}')">Resume</button>`);
+    if (t.state !== "closed") buttons.push(`<button onclick="closeTicket('${t.id}')">Close</button>`);
+    buttons.push(`<button onclick="history('${t.id}')">History</button>`);
+    return `<tr class="state-${t.state}">
+      <td>${t.id}</td><td>${t.source}</td><td>${t.severity}</td>
+      <td><span class="badge state-${t.state}">${t.state}</span></td>
+      <td>L${t.level}${t.escalated ? "!" : ""}</td>
+      <td>${t.owner || "(unassigned)"}<br><small>${t.shift_id}</small></td>
+      <td>${t.occurrence}</td><td><small>${t.opened_at}</small></td>
+      <td><small>${dueText(t)}</small></td>
+      <td>${buttons.join(" ")}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function act(kind, id) {
+  const actor = prompt("Operator name?", "alice");
+  if (!actor) return;
+  const note = prompt("Note (optional)?", "") || "";
+  await api(`/api/incidents/${kind}`, {id, actor, note});
+  load();
+}
+
+async function suspend(id) {
+  const actor = prompt("Operator name?", "alice");
+  if (!actor) return;
+  const minutes = parseInt(prompt("Suspend minutes?", "20"), 10);
+  if (!minutes) return;
+  const reason = prompt("Reason?", "") || "";
+  await api("/api/incidents/suspend", {id, actor, minutes, reason});
+  load();
+}
+
+async function closeTicket(id) {
+  const actor = prompt("Closing operator?", "alice");
+  if (!actor) return;
+  const note = prompt("Close note?", "") || "";
+  await api("/api/incidents/close", {id, actor, note});
+  load();
+}
+
+async function history(id) {
+  const data = await api("/api/incidents/history?id=" + encodeURIComponent(id));
+  if (!data) return;
+  document.getElementById("history-body").textContent =
+    data.events.map((e) => `${e.seq}  ${e.at}  ${e.kind}  by ${e.actor || "-"}  ${e.note || ""}`).join("\n");
+  document.getElementById("history-dialog").showModal();
+}
+
+async function runDue() {
+  const at = prompt("Run due at (ISO, blank = server now)?", "") || "";
+  const result = await api("/api/incidents/run-due", at ? {at} : {});
+  if (result) alert(`Expired: ${result.expired.length}\nEscalated: ${result.escalated.length}`);
+  load();
+}
+
+document.getElementById("state-filter").onchange = load;
+document.getElementById("source-filter").onchange = load;
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

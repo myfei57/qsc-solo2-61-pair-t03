@@ -6,6 +6,7 @@ from tunnelnet.cabin import Cabin
 from tunnelnet.cable import Cable
 from tunnelnet.drain import Pit
 from tunnelnet.fire import Detector
+from tunnelnet.incident import Shift
 
 from .runtime import Runtime
 
@@ -15,6 +16,19 @@ SEED_AT = "2026-01-01T00:00:00Z"
 def seed_defaults(rt: Runtime) -> None:
     """Make sure every component has a usable starting value."""
 
+    # Long lived three level roster so seeded and simulated alarms in 2025-2029
+    # always resolve to an owner. Real deployments replace these with scheduled
+    # day/night shifts entered through the roster API.
+    for level, operator in ((1, "alice"), (2, "bob"), (3, "carol")):
+        rt.roster.add(
+            Shift(
+                f"seed-l{level}",
+                "2025-01-01T00:00:00+00:00",
+                "2030-01-01T00:00:00+00:00",
+                operator,
+                level,
+            )
+        )
     rt.namespaces.add("segment-a", "segment A")
     rt.namespaces.add("segment-b", "segment B")
 

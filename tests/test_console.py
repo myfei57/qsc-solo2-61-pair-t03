@@ -55,7 +55,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "access", "drain", "ventilation", "fire", "patrol", "quota", "cables", "environment", "audit"},
+            {"store", "access", "drain", "ventilation", "fire", "patrol", "quota", "cables", "environment", "audit", "incidents"},
         )
 
         status, snapshot = self.call("GET", "/api/snapshot")
@@ -78,6 +78,7 @@ class ConsoleCase(unittest.TestCase):
                 "cables",
                 "suppression",
                 "audit",
+                "incidents",
             },
         )
 
@@ -579,6 +580,126 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/api/ops/reset-store")
         self.assertTrue(body["reset"])
         self.assertEqual(body["records"], 0)
+
+
+    def test_incident_closed_loop_over_http(self) -> None:
+        at0 = "2026-03-01T08:00:00+00:00"
+        status, body = self.call(
+            "POST", "/api/incidents/report",
+            {"source": "env", "dedupe_key": "env:s-1:overtemp", "severity": "major",
+             "at": at0, "report_id": "rep-1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["created"])
+        ticket_id = body["ticket"]["id"]
+        self.assertEqual(body["ticket"]["state"], "open")
+        self.assertEqual(body["ticket"]["owner"], "alice")
+
+        # Idempotent replay: same report_id returns the same ticket, no second created.
+        _, replay = self.call(
+            "POST", "/api/incidents/report",
+            {"source": "env", "dedupe_key": "env:s-1:overtemp", "severity": "major",
+             "at": at0, "report_id": "rep-1"},
+        )
+        self.assertFalse(replay["created"])
+        self.assertEqual(replay["ticket"]["id"], ticket_id)
+
+        # Second distinct raw report merges onto the same ticket.
+        _, merged = self.call(
+            "POST", "/api/incidents/report",
+            {"source": "env", "dedupe_key": "env:s-1:overtemp", "severity": "major",
+             "at": "2026-03-01T08:05:00+00:00", "report_id": "rep-2"},
+        )
+        self.assertFalse(merged["created"])
+        self.assertEqual(merged["ticket"]["occurrence"], 2)
+
+        status, _ = self.call(
+            "POST", "/api/incidents/ack", {"id": ticket_id, "actor": "alice", "at": at0}
+        )
+        self.assertEqual(status, 200)
+        status, suspended = self.call(
+            "POST", "/api/incidents/suspend",
+            {"id": ticket_id, "actor": "alice", "minutes": 10, "reason": "waiting",
+             "at": "2026-03-01T08:02:00+00:00"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(suspended["state"], "suspended")
+
+        # Before due time nothing happens; after it the ticket pops back to OPEN.
+        status, before = self.call("POST", "/api/incidents/run-due", {"at": "2026-03-01T08:10:00+00:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(before["expired"], [])
+        status, after = self.call("POST", "/api/incidents/run-due", {"at": "2026-03-01T08:16:00+00:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(after["expired"], [ticket_id])
+        _, reopened = self.call("GET", "/api/incidents", query={"state": ["open"]})
+        self.assertEqual(reopened["tickets"][0]["id"], ticket_id)
+
+        # Escalation: MAJOR ack SLA 15 minutes after the reopen deadline.
+        _, esc = self.call("POST", "/api/incidents/run-due", {"at": "2026-03-01T08:40:00+00:00"})
+        self.assertIn(ticket_id, esc["escalated"])
+        _, one = self.call("GET", "/api/incidents/history", query={"id": [ticket_id]})
+        kinds = [event["kind"] for event in one["events"]]
+        self.assertEqual(kinds.count("escalated"), 1)
+
+        status, closed = self.call(
+            "POST", "/api/incidents/close",
+            {"id": ticket_id, "actor": "bob", "note": "fixed", "at": "2026-03-01T08:42:00+00:00"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(closed["state"], "closed")
+
+        # History is readable and verifies; queue and counts reflect closure.
+        status, verify = self.call("GET", "/api/incidents/verify")
+        self.assertEqual(status, 200)
+        self.assertTrue(verify["verified"])
+        _, counts = self.call("GET", "/api/incidents/counts")
+        self.assertEqual(counts["closed"], 1)
+        self.assertEqual(counts["open"], 0)
+
+        # Closed alarm with the same dedupe key reopens a brand new ticket.
+        _, again = self.call(
+            "POST", "/api/incidents/report",
+            {"source": "env", "dedupe_key": "env:s-1:overtemp", "severity": "major",
+             "at": "2026-03-01T09:00:00+00:00", "report_id": "rep-3"},
+        )
+        self.assertTrue(again["created"])
+        self.assertNotEqual(again["ticket"]["id"], ticket_id)
+
+    def test_env_and_fire_alarms_flow_into_shared_center(self) -> None:
+        # The moving average filter needs the threshold under the first sample.
+        self.call("POST", "/api/env/threshold", {"threshold": 10.0})
+        status, body = self.call(
+            "POST", "/api/env/sample",
+            {"sensor_id": "sensor-3", "value": 50.0, "at": "2026-03-01T08:00:00+00:00",
+             "report_id": "env-r1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["alarmed"])
+        self.assertTrue(body["ticket"]["created"])
+        env_ticket = body["ticket"]["id"]
+
+        status, body = self.call(
+            "POST", "/api/fire/detect",
+            {"detector_id": "detector-1", "at": "2026-03-01T08:01:00+00:00", "report_id": "fire-r1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ticket"]["created"])
+        self.assertEqual(body["ticket"]["state"], "open")
+
+        _, listing = self.call("GET", "/api/incidents")
+        sources = {ticket["source"] for ticket in listing["tickets"]}
+        self.assertEqual(sources, {"env", "fire"})
+        # Env and fire pages both see the same disposition snapshot keys.
+        _, snapshot = self.call("GET", "/api/snapshot")
+        self.assertEqual(snapshot["incidents"]["counts"]["open"], 2)
+        # Idempotent env replay merges, occurrence grows.
+        _, replay2 = self.call(
+            "POST", "/api/env/sample",
+            {"sensor_id": "sensor-3", "value": 50.0, "at": "2026-03-01T08:02:00+00:00",
+             "report_id": "env-r1"},
+        )
+        self.assertFalse(replay2["ticket"]["created"])
 
 
 class WsgiCase(unittest.TestCase):

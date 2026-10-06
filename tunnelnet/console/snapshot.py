@@ -30,4 +30,8 @@ def collect(rt: "Runtime") -> dict[str, object]:
         "cables": rt.cables.summary().as_dict(),
         "suppression": {"zones": rt.suppression.distinct_zones()},
         "audit": rt.audit.state().as_dict(),
+        "incidents": {
+            "counts": rt.incidents.counts(),
+            "tickets": [ticket.as_dict() for ticket in rt.incidents.list()],
+        },
     }

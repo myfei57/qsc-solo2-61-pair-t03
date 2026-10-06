@@ -31,4 +31,6 @@ def collect(rt: "Runtime") -> dict[str, str]:
         "cables": rt.cables.describe(),
         "suppression": rt.suppression.describe(),
         "audit": rt.audit.describe(),
+        "incidents": rt.incidents.describe(),
+        "roster": rt.roster.describe(),
     }

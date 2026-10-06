@@ -48,6 +48,7 @@ def text_report(rt: "Runtime") -> str:
         f"quota allocated={telemetry.quota_allocated:.4f} usage={telemetry.quota_usage:.4f}",
         f"fire detectors={telemetry.fire_detectors} alarms={telemetry.fire_alarms}",
         f"store records={telemetry.store_records}",
+        f"incidents: {rt.incidents.describe()}",
     ]
     return "\n".join(rows) + "\n"
 
@@ -93,4 +94,5 @@ def dashboard(rt: "Runtime") -> dict[str, object]:
         },
         "audit": {"count": rt.audit.count(), "by_event": rt.audit.summary()},
         "access": rt.access.summary(),
+        "incidents": rt.incidents.counts(),
     }
